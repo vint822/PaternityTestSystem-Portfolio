@@ -1,0 +1,43 @@
+# .NET / Visual Studio
+**/bin/
+**/obj/
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+TestResults/
+*.trx
+*.coverage*
+
+# Local data, settings, credentials and generated documents
+*.db*
+*.sqlite*
+*.db3
+*.bak
+*.log
+*.tmp
+*.zip
+*.pfx
+*.pem
+*.key
+.env*
+appsettings*.json
+deploymentsettings*.json
+secrets.json
+*.docx
+*.doc
+*.pdf
+*.xlsx
+*.csv
+!samples/sample_genotype.csv
+screenshots/*
+!screenshots/.gitkeep
+
+# Local tools and OS metadata
+.validation/
+.publish/
+.DS_Store
+Thumbs.db
