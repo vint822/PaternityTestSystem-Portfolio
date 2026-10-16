@@ -1,154 +1,223 @@
-using System.Diagnostics;
-using System.Globalization;
 using Microsoft.VisualBasic.FileIO;
 using PaternityTestSystem.Portfolio.Models;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 
-namespace PaternityTestSystem.Portfolio.Parsing;
-
-public sealed class GenotypeCsvParseResult
+namespace PaternityTestSystem.Portfolio.Parsing
 {
-    public List<MarkerGenotype> Markers { get; } = [];
-    public List<string> Warnings { get; } = [];
-    public List<string> Errors { get; } = [];
-    public bool HasErrors => Errors.Count > 0;
-}
-
-public static class GenotypeCsvParser
-{
-    public static Task<GenotypeCsvParseResult> ParseAsync(
-        string filePath,
-        CancellationToken cancellationToken = default) =>
-        Task.Run(() => Parse(filePath, cancellationToken), cancellationToken);
-
-    private static GenotypeCsvParseResult Parse(string filePath, CancellationToken cancellationToken)
+    public class GenotypeCsvParseResult
     {
-        var result = new GenotypeCsvParseResult();
-        if (string.IsNullOrWhiteSpace(filePath))
-        {
-            result.Errors.Add("CSV file path is empty.");
-            return result;
-        }
+        public List<MarkerGenotype> Markers { get; set; }
+            = new List<MarkerGenotype>();
 
-        if (!File.Exists(filePath))
-        {
-            result.Errors.Add("CSV file does not exist.");
-            return result;
-        }
+        public List<string> Warnings { get; set; }
+            = new List<string>();
 
-        var alleleMap = new Dictionary<string, List<double>>(StringComparer.OrdinalIgnoreCase);
-        var markerOrder = new List<string>();
+        public List<string> Errors { get; set; }
+            = new List<string>();
 
-        try
-        {
-            using var parser = new TextFieldParser(filePath);
-            parser.TextFieldType = FieldType.Delimited;
-            parser.SetDelimiters(",");
-            parser.HasFieldsEnclosedInQuotes = true;
-
-            if (parser.EndOfData)
-            {
-                result.Errors.Add("CSV file is empty.");
-                return result;
-            }
-
-            var headers = parser.ReadFields();
-            if (headers is null)
-            {
-                result.Errors.Add("CSV header row is missing.");
-                return result;
-            }
-
-            var headerIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            for (var index = 0; index < headers.Length; index++)
-            {
-                if (!headerIndex.TryAdd(headers[index].Trim(), index))
-                    result.Errors.Add("CSV header contains a duplicate column name.");
-            }
-
-            if (!headerIndex.TryGetValue("Marker", out var markerIndex))
-                result.Errors.Add("CSV header is missing required column: Marker.");
-            if (!headerIndex.TryGetValue("Allele", out var alleleIndex))
-                result.Errors.Add("CSV header is missing required column: Allele.");
-            if (result.HasErrors)
-                return result;
-
-            while (!parser.EndOfData)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var rowNumber = parser.LineNumber;
-                var fields = parser.ReadFields();
-                if (fields is null)
-                    continue;
-
-                var marker = GetField(fields, markerIndex).Trim();
-                var alleleText = GetField(fields, alleleIndex).Trim();
-                if (marker.Length == 0 && alleleText.Length == 0)
-                {
-                    result.Warnings.Add($"Row {rowNumber}: empty marker and allele were skipped.");
-                    continue;
-                }
-
-                if (marker.Length == 0 || alleleText.Length == 0)
-                {
-                    result.Errors.Add($"Row {rowNumber}: both marker and allele are required.");
-                    continue;
-                }
-
-                if (!double.TryParse(alleleText, NumberStyles.Float, CultureInfo.InvariantCulture,
-                        out var allele) || !double.IsFinite(allele) || allele < 0)
-                {
-                    // Do not silently turn a partly invalid genotype into a homozygous result.
-                    result.Errors.Add($"Row {rowNumber}: allele must be a finite, non-negative number.");
-                    continue;
-                }
-
-                if (!alleleMap.TryGetValue(marker, out var alleles))
-                {
-                    alleles = [];
-                    alleleMap.Add(marker, alleles);
-                    markerOrder.Add(marker);
-                }
-
-                alleles.Add(allele);
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (MalformedLineException ex)
-        {
-            Debug.WriteLine(ex);
-            result.Errors.Add($"CSV format is invalid at line {ex.LineNumber}.");
-            return result;
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine(ex);
-            result.Errors.Add("CSV could not be read. Please check the file and try again.");
-            return result;
-        }
-
-        foreach (var marker in markerOrder)
-        {
-            var alleles = alleleMap[marker];
-            if (alleles.Count > 2)
-            {
-                result.Errors.Add($"Marker '{marker}' has more than two alleles.");
-                continue;
-            }
-
-            // A single observed allele is represented as a homozygous pair.
-            var secondAllele = alleles.Count == 1 ? alleles[0] : alleles[1];
-            result.Markers.Add(new MarkerGenotype(marker, new Genotype(alleles[0], secondAllele)));
-        }
-
-        if (result.Markers.Count == 0 && !result.HasErrors)
-            result.Errors.Add("CSV contains no genotype data.");
-
-        return result;
+        public bool HasErrors => Errors.Count > 0;
     }
 
-    private static string GetField(string[] fields, int index) =>
-        index >= 0 && index < fields.Length ? fields[index] : string.Empty;
+    public static class GenotypeCsvParser
+    {
+        /// <summary>
+        /// Parses a genotype CSV file without blocking the WPF UI thread.
+        /// </summary>
+        public static Task<GenotypeCsvParseResult> ParseAsync(string filePath)
+        {
+            return Task.Run(() => Parse(filePath));
+        }
+
+        private static GenotypeCsvParseResult Parse(string filePath)
+        {
+            var result = new GenotypeCsvParseResult();
+
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                result.Errors.Add("CSV file path is empty.");
+                return result;
+            }
+
+            if (!File.Exists(filePath))
+            {
+                Debug.WriteLine($"CSV file not found: {filePath}");
+
+                result.Errors.Add("CSV file does not exist.");
+                return result;
+            }
+
+            var alleleMap =
+                new Dictionary<string, List<double>>(
+                    StringComparer.OrdinalIgnoreCase);
+
+            var markerOrder = new List<string>();
+
+            try
+            {
+                using var parser = new TextFieldParser(filePath);
+
+                parser.TextFieldType = FieldType.Delimited;
+                parser.SetDelimiters(",");
+                parser.HasFieldsEnclosedInQuotes = true;
+
+                if (parser.EndOfData)
+                {
+                    result.Errors.Add("CSV file is empty.");
+                    return result;
+                }
+
+                var headers = parser.ReadFields();
+
+                if (headers == null)
+                {
+                    result.Errors.Add("CSV header row is missing.");
+                    return result;
+                }
+
+                var headerIndex = headers
+                    .Select((header, index) => new
+                    {
+                        Header = header.Trim(),
+                        Index = index
+                    })
+                    .ToDictionary(
+                        item => item.Header,
+                        item => item.Index,
+                        StringComparer.OrdinalIgnoreCase);
+
+                if (!headerIndex.TryGetValue(
+                        "Marker",
+                        out var markerIndex))
+                {
+                    result.Errors.Add(
+                        "CSV header is missing required column: Marker.");
+
+                    return result;
+                }
+
+                if (!headerIndex.TryGetValue(
+                        "Allele",
+                        out var alleleIndex))
+                {
+                    result.Errors.Add(
+                        "CSV header is missing required column: Allele.");
+
+                    return result;
+                }
+
+                var rowNumber = 1;
+
+                while (!parser.EndOfData)
+                {
+                    rowNumber++;
+
+                    var fields = parser.ReadFields();
+
+                    if (fields == null)
+                    {
+                        continue;
+                    }
+
+                    var marker =
+                        GetField(fields, markerIndex).Trim();
+
+                    var alleleText =
+                        GetField(fields, alleleIndex).Trim();
+
+                    if (string.IsNullOrWhiteSpace(marker) ||
+                        string.IsNullOrWhiteSpace(alleleText))
+                    {
+                        continue;
+                    }
+
+                    if (!double.TryParse(
+                            alleleText,
+                            NumberStyles.Float,
+                            CultureInfo.InvariantCulture,
+                            out var allele))
+                    {
+                        result.Warnings.Add(
+                            $"Row {rowNumber}: allele '{alleleText}' " +
+                            $"for marker '{marker}' could not be parsed.");
+
+                        continue;
+                    }
+
+                    if (!alleleMap.TryGetValue(
+                            marker,
+                            out var alleles))
+                    {
+                        alleles = new List<double>();
+
+                        alleleMap[marker] = alleles;
+                        markerOrder.Add(marker);
+                    }
+
+                    alleles.Add(allele);
+                }
+            }
+            catch (MalformedLineException ex)
+            {
+                result.Errors.Add(
+                    $"CSV format error near row {ex.LineNumber}.");
+
+                Debug.WriteLine(ex);
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex);
+
+                result.Errors.Add(
+                    "Unexpected error occurred while parsing CSV.");
+
+                return result;
+            }
+
+            foreach (var marker in markerOrder)
+            {
+                var alleles = alleleMap[marker];
+
+                // Normalize homozygous markers so every genotype
+                // is represented by two allele values.
+                if (alleles.Count == 1)
+                {
+                    alleles.Add(alleles[0]);
+                }
+                else if (alleles.Count > 2)
+                {
+                    result.Errors.Add(
+                        $"Marker '{marker}' has {alleles.Count} alleles; " +
+                        "expected one or two.");
+
+                    continue;
+                }
+
+                result.Markers.Add(
+                    new MarkerGenotype(
+                        marker,
+                        new Genotype(
+                            alleles[0],
+                            alleles[1])));
+            }
+
+            return result;
+        }
+
+        private static string GetField(
+            string[] fields,
+            int index)
+        {
+            return index >= 0 && index < fields.Length
+                ? fields[index]
+                : string.Empty;
+        }
+    }
 }
