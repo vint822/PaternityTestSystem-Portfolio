@@ -1,15 +1,22 @@
-namespace PaternityTestSystem.Portfolio.Models;
+using System.Collections.Generic;
 
-public sealed class QualityControlSummary
+namespace PaternityTestSystem.Portfolio.Models
 {
-    public List<QualityControlMarkerResult> Results { get; } = [];
-    public List<string> Warnings { get; } = [];
-    public List<string> Errors { get; } = [];
-    public int TotalMarkerCount { get; internal set; }
-    public int MatchedCount => Results.Count(r => r.Status == QualityControlMarkerStatus.Matched);
-    public int MissingMarkerCount => Results.Count(r => r.Status == QualityControlMarkerStatus.Missing);
-    public int MismatchedCount => Results.Count(r => r.Status == QualityControlMarkerStatus.Mismatched);
-    public bool IsPassed => Errors.Count == 0 && TotalMarkerCount > 0 &&
-                            MatchedCount == TotalMarkerCount;
-    public string Status => IsPassed ? "PASS" : "FAIL";
+    public class QualityControlSummary
+    {
+        public bool IsPassed { get; set; }
+        public int TotalMarkerCount { get; set; }
+        public int MatchedCount { get; set; }
+        public int MismatchedCount { get; set; }
+        public int MissingMarkerCount { get; set; }
+
+        public List<QualityControlMarkerResult> Results { get; set; }
+            = new List<QualityControlMarkerResult>();
+
+        public List<string> Warnings { get; set; }
+            = new List<string>();
+
+        public List<string> Errors { get; set; }
+            = new List<string>();
+    }
 }
