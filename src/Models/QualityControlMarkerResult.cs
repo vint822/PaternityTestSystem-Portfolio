@@ -1,15 +1,19 @@
-namespace PaternityTestSystem.Portfolio.Models;
-
-public enum QualityControlMarkerStatus
+namespace PaternityTestSystem.Portfolio.Models
 {
-    Matched,
-    Missing,
-    Mismatched,
-    Extra
-}
+    public class QualityControlMarkerResult
+    {
+        public string Marker { get; set; }
+            = string.Empty;
 
-public sealed record QualityControlMarkerResult(
-    string Marker,
-    Genotype? Expected,
-    Genotype? Actual,
-    QualityControlMarkerStatus Status);
+        public double? ExpectedAllele1 { get; set; }
+        public double? ExpectedAllele2 { get; set; }
+        public double? ActualAllele1 { get; set; }
+        public double? ActualAllele2 { get; set; }
+
+        public bool IsMatched { get; set; }
+        public bool IsWarning { get; set; }
+
+        public string Message { get; set; }
+            = string.Empty;
+    }
+}
