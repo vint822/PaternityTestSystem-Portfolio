@@ -1,303 +1,723 @@
+using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 
-namespace PaternityTestSystem.Portfolio.Storage;
-
-/// <summary>
-/// Stores files under a caller-selected root. The application must control that root
-/// and prevent concurrent filesystem changes by untrusted users. Link checks are
-/// defense in depth, not an atomic filesystem sandbox. Do not share one operation
-/// between concurrent writers or run compensation while a writer is active.
-/// </summary>
-public sealed class CaseFileStorageService
+namespace PaternityTestSystem.Portfolio.Storage
 {
-    private static readonly string[] Categories = ["InputFiles", "Reports", "Calculations"];
-    private readonly string root;
-
-    public CaseFileStorageService(string rootPath)
+    public static class CaseFileStorageService
     {
-        if (string.IsNullOrWhiteSpace(rootPath))
-            throw new ArgumentException("A storage root is required.", nameof(rootPath));
+        private const string InputFilesFolderName = "InputFiles";
+        private const string ReportsFolderName = "Reports";
+        private const string CalculationsFolderName = "Calculations";
 
-        try
-        {
-            root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootPath));
-            RejectLinks(root);
-        }
-        catch (Exception ex) when (IsStorageError(ex))
-        {
-            Debug.WriteLine(ex);
-            throw new ArgumentException("The storage root is not available.", nameof(rootPath));
-        }
-    }
+        private static readonly string PortfolioCasesRoot =
+            Path.Combine(
+                AppContext.BaseDirectory,
+                "PortfolioData",
+                "Cases");
 
-    public string GetCaseFolderPath(string caseId)
-    {
-        var identifier = ValidateCaseId(caseId);
-        try { return DirectChild(root, identifier); }
-        catch (Exception ex) when (IsStorageError(ex))
+        public static string GetCasesRootPath()
         {
-            Debug.WriteLine(ex);
-            throw new IOException("The case folder path is not available.");
+            return PortfolioCasesRoot;
         }
-    }
 
-    /// <summary>
-    /// Creates fresh GUID folders in all three categories. Case folders and earlier
-    /// operations are never owned by the returned handle and are never cleaned up.
-    /// </summary>
-    public StorageOperation BeginOperation(string caseId)
-    {
-        var operation = new StorageOperation(this, ValidateCaseId(caseId));
-        var created = new List<string>();
-        try
+        public static string GetCaseFolderPath(string caseNo)
         {
-            foreach (var category in Categories)
+            return GetCaseFolderPath(
+                caseNo,
+                GetCasesRootPath());
+        }
+
+        internal static string GetCaseFolderPath(
+            string caseNo,
+            string casesRoot)
+        {
+            var normalizedCaseNo =
+                ValidateCaseNumberPathSegment(caseNo);
+
+            string normalizedCasesRoot;
+            string caseFolderPath;
+
+            try
             {
-                var categoryFolder = DirectChild(GetCaseFolderPath(operation.CaseId), category);
-                EnsureDirectory(categoryFolder);
-                var folder = DirectChild(categoryFolder, operation.Id);
-                RejectLinks(folder);
-                if (GetAttributesIfPresent(folder) is not null)
-                    throw new IOException("The operation folder already exists.");
+                normalizedCasesRoot =
+                    Path.TrimEndingDirectorySeparator(
+                        Path.GetFullPath(casesRoot));
 
-                Directory.CreateDirectory(folder);
-                created.Add(folder);
-                RejectLinks(folder);
+                caseFolderPath =
+                    Path.GetFullPath(
+                        Path.Combine(
+                            normalizedCasesRoot,
+                            normalizedCaseNo));
             }
-
-            return operation;
-        }
-        catch (Exception ex) when (IsStorageError(ex))
-        {
-            Debug.WriteLine(ex);
-            var cleaned = TryRemoveFolders(created);
-            throw new IOException(cleaned
-                ? "The file operation could not be started."
-                : "The file operation could not be started; temporary file cleanup needs attention.");
-        }
-    }
-
-    /// <summary>
-    /// Copies without modifying the source or overwriting an existing destination.
-    /// A failed or cancelled copy compensates this entire operation. Callers must
-    /// also compensate when a later report or database step fails.
-    /// </summary>
-    public async Task<string> CopyInputFileAsync(
-        StorageOperation operation,
-        string sourcePath,
-        string storedFileName,
-        CancellationToken cancellationToken = default)
-    {
-        ValidateOperation(operation);
-        try
-        {
-            if (string.IsNullOrWhiteSpace(sourcePath))
-                throw new ArgumentException("An input file is required.");
-
-            var fullSourcePath = Path.GetFullPath(sourcePath);
-            RejectLinks(fullSourcePath);
-            var destinationPath = OutputPath(operation, "InputFiles", storedFileName);
-            await using (var source = new FileStream(
-                fullSourcePath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                81920, FileOptions.Asynchronous | FileOptions.SequentialScan))
-            await using (var destination = new FileStream(
-                destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                81920, FileOptions.Asynchronous))
-            {
-                await source.CopyToAsync(destination, cancellationToken);
-            }
-
-            return destinationPath;
-        }
-        catch (Exception ex) when (IsStorageError(ex) || ex is OperationCanceledException)
-        {
-            Debug.WriteLine(ex);
-            var cleaned = TryCompensate(operation, out _);
-            if (ex is OperationCanceledException && cleaned)
-                throw new OperationCanceledException("Input copying was cancelled.", cancellationToken);
-
-            throw new IOException(cleaned
-                ? "The input file could not be copied."
-                : "The input file could not be copied; temporary file cleanup needs attention.");
-        }
-    }
-
-    // The caller writes the returned paths with CreateNew, closes all handles, and
-    // compensates the operation if its file/database workflow cannot complete.
-    public string GetReportFilePath(StorageOperation operation, string fileName) =>
-        OutputPath(operation, "Reports", fileName);
-
-    public string GetCalculationFilePath(StorageOperation operation, string fileName) =>
-        OutputPath(operation, "Calculations", fileName);
-
-    /// <summary>
-    /// Removes only this handle's operation folders. On false, keep the handle and
-    /// retry after addressing the warning. Even a partial cleanup closes the
-    /// operation to further writes; a new attempt needs a new operation.
-    /// </summary>
-    public bool TryCompensate(StorageOperation operation, out string? warning)
-    {
-        warning = null;
-        if (operation is null || !ReferenceEquals(operation.Owner, this))
-        {
-            warning = "The file operation does not belong to this storage service.";
-            return false;
-        }
-
-        operation.Closed = true;
-        var cleaned = TryRemoveFolders(Categories.Select(category => OperationFolder(operation, category)));
-        if (!cleaned)
-            warning = "Some temporary files could not be removed; cleanup needs attention.";
-        return cleaned;
-    }
-
-    public static string SanitizeFileName(string? fileName)
-    {
-        var sanitized = new string((fileName ?? string.Empty).Trim()
-            .Select(ch => char.IsControl(ch) || "<>:\"/\\|?*".Contains(ch) ? '_' : ch)
-            .Take(120).ToArray()).TrimEnd(' ', '.');
-        if (string.IsNullOrWhiteSpace(sanitized))
-            sanitized = "file";
-
-        var stem = sanitized.Split('.')[0].TrimEnd(' ').ToUpperInvariant();
-        if (stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$" ||
-            (stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) ||
-                                  stem.StartsWith("LPT", StringComparison.Ordinal)) &&
-             "123456789¹²³".Contains(stem[3])))
-            sanitized = "_" + sanitized;
-        return sanitized;
-    }
-
-    private string OutputPath(StorageOperation operation, string category, string fileName)
-    {
-        ValidateOperation(operation);
-        try
-        {
-            var folder = OperationFolder(operation, category);
-            RejectLinks(folder);
-            if (!Directory.Exists(folder))
-                throw new IOException("The operation folder is unavailable.");
-            var output = DirectChild(folder, SanitizeFileName(fileName));
-            RejectLinks(output);
-            if (GetAttributesIfPresent(output) is not null)
-                throw new IOException("An output file already exists.");
-            return output;
-        }
-        catch (Exception ex) when (IsStorageError(ex))
-        {
-            Debug.WriteLine(ex);
-            throw new IOException("An output path could not be prepared.");
-        }
-    }
-
-    private string OperationFolder(StorageOperation operation, string category) =>
-        DirectChild(DirectChild(GetCaseFolderPath(operation.CaseId), category), operation.Id);
-
-    private void ValidateOperation(StorageOperation operation)
-    {
-        if (operation is null || !ReferenceEquals(operation.Owner, this) || operation.Closed)
-            throw new ArgumentException("An active operation from this storage service is required.", nameof(operation));
-    }
-
-    private static string ValidateCaseId(string caseId)
-    {
-        // A deliberately narrow identifier avoids separators, drive syntax, device
-        // names, trailing-dot aliases and alternate data streams across platforms.
-        if (string.IsNullOrWhiteSpace(caseId) || caseId.Length > 80 ||
-            !caseId.All(ch => char.IsAsciiLetterOrDigit(ch) || ch is '-' or '_') ||
-            !string.Equals(caseId, SanitizeFileName(caseId), StringComparison.Ordinal))
-            throw new ArgumentException("The case identifier is invalid.", nameof(caseId));
-        return caseId;
-    }
-
-    private static string DirectChild(string parent, string name)
-    {
-        var child = Path.GetFullPath(Path.Combine(parent, name));
-        var relative = Path.GetRelativePath(parent, child);
-        if (Path.IsPathRooted(relative) || relative is "." or ".." ||
-            relative.Contains('/') || relative.Contains('\\'))
-            throw new IOException("A storage path is outside its allowed folder.");
-        return child;
-    }
-
-    private static void EnsureDirectory(string path)
-    {
-        RejectLinks(path);
-        Directory.CreateDirectory(path);
-        RejectLinks(path);
-    }
-
-    private static void RejectLinks(string path)
-    {
-        for (var current = Path.GetFullPath(path); current is not null; current = Path.GetDirectoryName(current))
-        {
-            if (GetAttributesIfPresent(current) is { } attributes &&
-                (attributes & FileAttributes.ReparsePoint) != 0)
-                throw new IOException("Linked storage paths are not allowed.");
-        }
-    }
-
-    private static FileAttributes? GetAttributesIfPresent(string path)
-    {
-        try { return File.GetAttributes(path); }
-        catch (FileNotFoundException) { return null; }
-        catch (DirectoryNotFoundException) { return null; }
-    }
-
-    private static bool TryRemoveFolders(IEnumerable<string> folders)
-    {
-        var success = true;
-        foreach (var folder in folders)
-        {
-            try { DeleteOwnedTree(folder); }
-            catch (Exception ex) when (IsStorageError(ex))
+            catch (Exception ex)
+                when (ex is ArgumentException ||
+                      ex is NotSupportedException ||
+                      ex is PathTooLongException)
             {
                 Debug.WriteLine(ex);
-                success = false;
+
+                throw new ArgumentException(
+                    "案號無法用於案件資料夾。",
+                    nameof(caseNo));
+            }
+
+            var relativePath =
+                Path.GetRelativePath(
+                    normalizedCasesRoot,
+                    caseFolderPath);
+
+            var parentPath =
+                Path.GetDirectoryName(
+                    caseFolderPath);
+
+            var isDirectChild =
+                !Path.IsPathRooted(relativePath) &&
+                !string.Equals(
+                    relativePath,
+                    ".",
+                    StringComparison.Ordinal) &&
+                !ContainsDirectorySeparator(
+                    relativePath) &&
+                !string.IsNullOrWhiteSpace(
+                    parentPath) &&
+                string.Equals(
+                    Path.TrimEndingDirectorySeparator(
+                        Path.GetFullPath(parentPath)),
+                    normalizedCasesRoot,
+                    StringComparison.OrdinalIgnoreCase);
+
+            if (!isDirectChild)
+            {
+                throw new ArgumentException(
+                    "案號不可指向 CasesRoot 以外的資料夾。",
+                    nameof(caseNo));
+            }
+
+            return caseFolderPath;
+        }
+
+        public static string GetInputFilesFolderPath(
+            string caseNo)
+        {
+            return Path.Combine(
+                GetCaseFolderPath(caseNo),
+                InputFilesFolderName);
+        }
+
+        public static string GetInputFilesOperationFolderPath(
+            string caseNo,
+            string operationId)
+        {
+            return Path.Combine(
+                GetInputFilesFolderPath(caseNo),
+                SanitizePathPart(operationId));
+        }
+
+        public static string GetReportsFolderPath(
+            string caseNo)
+        {
+            return Path.Combine(
+                GetCaseFolderPath(caseNo),
+                ReportsFolderName);
+        }
+
+        public static string GetCalculationsFolderPath(
+            string caseNo)
+        {
+            return GetCalculationsFolderPath(
+                caseNo,
+                GetCasesRootPath());
+        }
+
+        internal static string GetCalculationsFolderPath(
+            string caseNo,
+            string casesRoot)
+        {
+            return Path.Combine(
+                GetCaseFolderPath(
+                    caseNo,
+                    casesRoot),
+                CalculationsFolderName);
+        }
+
+        public static string GetCalculationOperationFolderPath(
+            string caseNo,
+            string operationId)
+        {
+            return GetCalculationOperationFolderPath(
+                caseNo,
+                operationId,
+                GetCasesRootPath());
+        }
+
+        internal static string GetCalculationOperationFolderPath(
+            string caseNo,
+            string operationId,
+            string casesRoot)
+        {
+            if (string.IsNullOrWhiteSpace(operationId))
+            {
+                throw new ArgumentException(
+                    "Operation ID is required.",
+                    nameof(operationId));
+            }
+
+            return Path.Combine(
+                GetCalculationsFolderPath(
+                    caseNo,
+                    casesRoot),
+                SanitizePathPart(operationId));
+        }
+
+        public static void EnsureCaseFolders(
+            string caseNo)
+        {
+            EnsureCaseFolders(
+                caseNo,
+                GetCasesRootPath());
+        }
+
+        internal static void EnsureCaseFolders(
+            string caseNo,
+            string casesRoot)
+        {
+            var caseFolderPath =
+                GetCaseFolderPath(
+                    caseNo,
+                    casesRoot);
+
+            Directory.CreateDirectory(
+                Path.Combine(
+                    caseFolderPath,
+                    InputFilesFolderName));
+
+            Directory.CreateDirectory(
+                Path.Combine(
+                    caseFolderPath,
+                    ReportsFolderName));
+
+            Directory.CreateDirectory(
+                Path.Combine(
+                    caseFolderPath,
+                    CalculationsFolderName));
+        }
+
+        public static string CreateOperationId()
+        {
+            var timestamp =
+                DateTime.Now.ToString(
+                    "yyyyMMdd_HHmmss");
+
+            var suffix =
+                Guid.NewGuid()
+                    .ToString("N")
+                    .Substring(0, 4);
+
+            return
+                $"op_{timestamp}_{suffix}";
+        }
+
+        public static async Task<string>
+            CopyInputFileToCaseFolderAsync(
+                string caseNo,
+                string sourceFilePath,
+                string fileType)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    sourceFilePath))
+            {
+                throw new ArgumentException(
+                    "Source file path is required.",
+                    nameof(sourceFilePath));
+            }
+
+            if (!File.Exists(
+                    sourceFilePath))
+            {
+                throw new FileNotFoundException(
+                    "Input file does not exist.");
+            }
+
+            EnsureCaseFolders(caseNo);
+
+            var originalFileName =
+                Path.GetFileName(
+                    sourceFilePath);
+
+            var safeFileType =
+                SanitizePathPart(
+                    fileType);
+
+            var safeFileName =
+                SanitizeFileName(
+                    originalFileName);
+
+            var timestamp =
+                DateTime.UtcNow.ToString(
+                    "yyyyMMddHHmmssfff");
+
+            var storedFileName =
+                $"{safeFileType}_{timestamp}_{safeFileName}";
+
+            var storedFilePath =
+                Path.Combine(
+                    GetInputFilesFolderPath(
+                        caseNo),
+                    storedFileName);
+
+            await using (
+                var source =
+                    new FileStream(
+                        sourceFilePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.Read))
+            await using (
+                var destination =
+                    new FileStream(
+                        storedFilePath,
+                        FileMode.CreateNew,
+                        FileAccess.Write,
+                        FileShare.None))
+            {
+                await source.CopyToAsync(
+                    destination);
+            }
+
+            return storedFilePath;
+        }
+
+        public static async Task<string>
+            CopyInputFileToCaseOperationFolderAsync(
+                string caseNo,
+                string operationId,
+                string sourceFilePath,
+                string storedFileName)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    sourceFilePath))
+            {
+                throw new ArgumentException(
+                    "Source file path is required.",
+                    nameof(sourceFilePath));
+            }
+
+            if (!File.Exists(
+                    sourceFilePath))
+            {
+                throw new FileNotFoundException(
+                    "Input file does not exist.");
+            }
+
+            if (string.IsNullOrWhiteSpace(
+                    operationId))
+            {
+                throw new ArgumentException(
+                    "Operation ID is required.",
+                    nameof(operationId));
+            }
+
+            EnsureCaseFolders(caseNo);
+
+            var operationFolder =
+                GetInputFilesOperationFolderPath(
+                    caseNo,
+                    operationId);
+
+            Directory.CreateDirectory(
+                operationFolder);
+
+            var storedFilePath =
+                Path.Combine(
+                    operationFolder,
+                    SanitizeFileName(
+                        storedFileName));
+
+            await using (
+                var source =
+                    new FileStream(
+                        sourceFilePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.Read))
+            await using (
+                var destination =
+                    new FileStream(
+                        storedFilePath,
+                        FileMode.CreateNew,
+                        FileAccess.Write,
+                        FileShare.None))
+            {
+                await source.CopyToAsync(
+                    destination);
+            }
+
+            return storedFilePath;
+        }
+
+        public static bool TryDeleteInputFilesOperationFolder(
+            string caseNo,
+            string operationId,
+            out string? warning)
+        {
+            warning = null;
+
+            try
+            {
+                var inputRoot =
+                    Path.GetFullPath(
+                        GetInputFilesFolderPath(
+                            caseNo));
+
+                var operationFolder =
+                    Path.GetFullPath(
+                        GetInputFilesOperationFolderPath(
+                            caseNo,
+                            operationId));
+
+                var requiredPrefix =
+                    inputRoot.TrimEnd(
+                        Path.DirectorySeparatorChar,
+                        Path.AltDirectorySeparatorChar) +
+                    Path.DirectorySeparatorChar;
+
+                if (!operationFolder.StartsWith(
+                        requiredPrefix,
+                        StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(
+                        operationFolder,
+                        inputRoot,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    warning =
+                        "本次 CSV 資料夾路徑不安全，已略過自動清理。";
+
+                    return false;
+                }
+
+                if (!Directory.Exists(
+                        operationFolder))
+                {
+                    return true;
+                }
+
+                Directory.Delete(
+                    operationFolder,
+                    recursive: true);
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex);
+
+                warning =
+                    "本次 CSV 資料夾清理失敗，可能有檔案正在使用中。";
+
+                return false;
             }
         }
-        return success;
-    }
 
-    private static void DeleteOwnedTree(string folder)
-    {
-        RejectLinks(folder);
-        var attributes = GetAttributesIfPresent(folder);
-        if (attributes is null)
-            return;
-        if ((attributes.Value & FileAttributes.Directory) == 0)
-            throw new IOException("An operation folder is not a directory.");
-
-        foreach (var entry in Directory.EnumerateFileSystemEntries(folder))
+        public static string CreateReportFilePath(
+            string caseNo,
+            string documentName)
         {
-            var child = DirectChild(folder, Path.GetFileName(entry));
-            RejectLinks(child);
-            var childAttributes = File.GetAttributes(child);
-            if ((childAttributes & FileAttributes.Directory) != 0)
-                DeleteOwnedTree(child);
-            else
-                File.Delete(child);
+            EnsureCaseFolders(caseNo);
+
+            return Path.Combine(
+                GetReportsFolderPath(caseNo),
+                SanitizeFileName(
+                    documentName));
         }
 
-        RejectLinks(folder);
-        Directory.Delete(folder, recursive: false);
+        public static string CreateCalculationWorksheetFilePath(
+            string caseNo,
+            string operationId,
+            string documentName)
+        {
+            return CreateCalculationWorksheetFilePath(
+                caseNo,
+                operationId,
+                documentName,
+                GetCasesRootPath());
+        }
+
+        internal static string CreateCalculationWorksheetFilePath(
+            string caseNo,
+            string operationId,
+            string documentName,
+            string casesRoot)
+        {
+            EnsureCaseFolders(
+                caseNo,
+                casesRoot);
+
+            var operationFolder =
+                GetCalculationOperationFolderPath(
+                    caseNo,
+                    operationId,
+                    casesRoot);
+
+            Directory.CreateDirectory(
+                operationFolder);
+
+            return Path.Combine(
+                operationFolder,
+                SanitizeFileName(
+                    documentName));
+        }
+
+        public static bool TryDeleteCalculationWorksheet(
+            string caseNo,
+            string operationId,
+            string worksheetPath,
+            out string? warning)
+        {
+            return TryDeleteCalculationWorksheet(
+                caseNo,
+                operationId,
+                worksheetPath,
+                GetCasesRootPath(),
+                out warning);
+        }
+
+        internal static bool TryDeleteCalculationWorksheet(
+            string caseNo,
+            string operationId,
+            string worksheetPath,
+            string casesRoot,
+            out string? warning)
+        {
+            warning = null;
+
+            try
+            {
+                var operationFolder =
+                    Path.TrimEndingDirectorySeparator(
+                        Path.GetFullPath(
+                            GetCalculationOperationFolderPath(
+                                caseNo,
+                                operationId,
+                                casesRoot)));
+
+                var fullWorksheetPath =
+                    Path.GetFullPath(
+                        worksheetPath);
+
+                var relativePath =
+                    Path.GetRelativePath(
+                        operationFolder,
+                        fullWorksheetPath);
+
+                if (Path.IsPathRooted(
+                        relativePath) ||
+                    relativePath.StartsWith(
+                        "..",
+                        StringComparison.Ordinal) ||
+                    relativePath.IndexOfAny(
+                        new[]
+                        {
+                            Path.DirectorySeparatorChar,
+                            Path.AltDirectorySeparatorChar
+                        }) >= 0)
+                {
+                    warning =
+                        "計算核對表清理範圍驗證失敗，未刪除任何檔案。";
+
+                    return false;
+                }
+
+                if (File.Exists(
+                        fullWorksheetPath))
+                {
+                    File.Delete(
+                        fullWorksheetPath);
+                }
+
+                if (Directory.Exists(
+                        operationFolder) &&
+                    !Directory
+                        .EnumerateFileSystemEntries(
+                            operationFolder)
+                        .Any())
+                {
+                    Directory.Delete(
+                        operationFolder);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex);
+
+                warning =
+                    "本次計算核對表清理失敗，請人工確認檔案。";
+
+                return false;
+            }
+        }
+
+        public static bool TryDeleteReportFiles(
+            string caseNo,
+            IEnumerable<string> reportFilePaths,
+            out string? warning)
+        {
+            warning = null;
+
+            var cleanupFailed = false;
+
+            try
+            {
+                var reportsRoot =
+                    Path.GetFullPath(
+                        GetReportsFolderPath(
+                            caseNo));
+
+                var requiredPrefix =
+                    reportsRoot.TrimEnd(
+                        Path.DirectorySeparatorChar,
+                        Path.AltDirectorySeparatorChar) +
+                    Path.DirectorySeparatorChar;
+
+                foreach (
+                    var reportFilePath
+                    in reportFilePaths
+                        .Where(path =>
+                            !string.IsNullOrWhiteSpace(
+                                path))
+                        .Distinct(
+                            StringComparer.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var fullPath =
+                            Path.GetFullPath(
+                                reportFilePath);
+
+                        if (!fullPath.StartsWith(
+                                requiredPrefix,
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            cleanupFailed = true;
+                            continue;
+                        }
+
+                        if (File.Exists(
+                                fullPath))
+                        {
+                            File.Delete(
+                                fullPath);
+                        }
+                    }
+                    catch
+                    {
+                        cleanupFailed = true;
+                    }
+                }
+            }
+            catch
+            {
+                cleanupFailed = true;
+            }
+
+            if (cleanupFailed)
+            {
+                warning =
+                    "部分本次產生的 Word 報告無法清理，可能仍被其他程式使用。";
+
+                return false;
+            }
+
+            return true;
+        }
+
+        private static string SanitizePathPart(
+            string value)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    value))
+            {
+                return "Unknown";
+            }
+
+            var invalidChars =
+                Path.GetInvalidFileNameChars();
+
+            var sanitized =
+                new string(
+                    value
+                        .Trim()
+                        .Select(ch =>
+                            invalidChars.Contains(ch)
+                                ? '_'
+                                : ch)
+                        .ToArray());
+
+            return string.IsNullOrWhiteSpace(
+                sanitized)
+                ? "Unknown"
+                : sanitized;
+        }
+
+        private static string ValidateCaseNumberPathSegment(
+            string caseNo)
+        {
+            if (string.IsNullOrWhiteSpace(
+                    caseNo))
+            {
+                throw new ArgumentException(
+                    "案號不可為空白。",
+                    nameof(caseNo));
+            }
+
+            var normalizedCaseNo =
+                caseNo.Trim();
+
+            if (string.Equals(
+                    normalizedCaseNo,
+                    ".",
+                    StringComparison.Ordinal) ||
+                string.Equals(
+                    normalizedCaseNo,
+                    "..",
+                    StringComparison.Ordinal) ||
+                Path.IsPathRooted(
+                    normalizedCaseNo) ||
+                ContainsDirectorySeparator(
+                    normalizedCaseNo) ||
+                normalizedCaseNo.IndexOfAny(
+                    Path.GetInvalidFileNameChars()) >= 0)
+            {
+                throw new ArgumentException(
+                    "案號不可包含路徑或無效的檔名字元。",
+                    nameof(caseNo));
+            }
+
+            return normalizedCaseNo;
+        }
+
+        private static bool ContainsDirectorySeparator(
+            string value)
+        {
+            return
+                value.IndexOf(
+                    Path.DirectorySeparatorChar) >= 0 ||
+                value.IndexOf(
+                    Path.AltDirectorySeparatorChar) >= 0 ||
+                value.IndexOf('\\') >= 0 ||
+                value.IndexOf('/') >= 0;
+        }
+
+        private static string SanitizeFileName(
+            string fileName)
+        {
+            return SanitizePathPart(
+                fileName);
+        }
     }
-
-    private static bool IsStorageError(Exception ex) =>
-        ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException;
-}
-
-/// <summary>An in-process handle for one operation; never reconstruct it from user input.</summary>
-public sealed class StorageOperation
-{
-    internal StorageOperation(CaseFileStorageService owner, string caseId)
-    {
-        Owner = owner;
-        CaseId = caseId;
-    }
-
-    internal CaseFileStorageService Owner { get; }
-    internal bool Closed { get; set; }
-    public string CaseId { get; }
-    public string Id { get; } = Guid.NewGuid().ToString("N");
 }
