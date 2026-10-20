@@ -1,13 +1,25 @@
-namespace PaternityTestSystem.Portfolio.Models;
+using System.Collections.Generic;
 
-public sealed class PaternityCalculationSummary
+namespace PaternityTestSystem.Portfolio.Models
 {
-    public List<PaternityCalculationResult> Results { get; } = [];
-    public List<string> Warnings { get; } = [];
-    public List<string> Errors { get; } = [];
+    /// <summary>
+    /// Aggregate calculation summary.
+    /// </summary>
+    public class PaternityCalculationSummary
+    {
+        public List<PaternityCalculationResult> Results { get; set; }
+            = new List<PaternityCalculationResult>();
 
-    // A failed or incomplete operation must not expose a successful-looking total.
-    public double? Cpi { get; internal set; }
-    public int CalculatedMarkerCount => Results.Count;
-    public bool HasErrors => Errors.Count > 0;
+        public List<string> Warnings { get; set; }
+            = new List<string>();
+
+        public List<string> Errors { get; set; }
+            = new List<string>();
+
+        public double Cpi { get; set; }
+        public int CalculatedMarkerCount { get; set; }
+        public int ExcludedMarkerCount { get; set; }
+
+        public bool HasErrors => Errors.Count > 0;
+    }
 }
