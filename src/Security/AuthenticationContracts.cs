@@ -1,24 +1,66 @@
-namespace PaternityTestSystem.Portfolio.Security;
+using System.Threading.Tasks;
 
-/// <summary>Infrastructure input only; never return this record to a view.</summary>
-public sealed record StoredUser(string Id, string DisplayName, string PasswordHash, bool IsActive);
-
-public sealed record AuthenticatedUser(string Id, string DisplayName);
-
-public sealed record LoginResult(bool Success, string Message, AuthenticatedUser? User);
-
-public enum AuthenticationAction
+namespace PaternityTestSystem.Portfolio.Security
 {
-    Login,
-    Logout
-}
+    /// <summary>
+    /// Minimal user data required by the portfolio authentication flow.
+    /// Production user repositories and database models are not included.
+    /// </summary>
+    public class StoredUser
+    {
+        public string Id { get; set; } = string.Empty;
+        public string DisplayName { get; set; } = string.Empty;
+        public string PasswordHash { get; set; } = string.Empty;
+        public bool IsActive { get; set; } = true;
+    }
 
-public interface IUserLookup
-{
-    Task<StoredUser?> FindByNameAsync(string username, CancellationToken cancellationToken = default);
-}
+    public class AuthenticatedUser
+    {
+        public string Id { get; }
+        public string DisplayName { get; }
 
-public interface IAuthenticationAuditWriter
-{
-    Task WriteAsync(string userId, AuthenticationAction action, CancellationToken cancellationToken = default);
+        public AuthenticatedUser(
+            string id,
+            string displayName)
+        {
+            Id = id;
+            DisplayName = displayName;
+        }
+    }
+
+    public class LoginResult
+    {
+        public bool Success { get; }
+        public string Message { get; }
+        public AuthenticatedUser? User { get; }
+
+        public LoginResult(
+            bool success,
+            string message,
+            AuthenticatedUser? user)
+        {
+            Success = success;
+            Message = message;
+            User = user;
+        }
+    }
+
+    public enum AuthenticationAction
+    {
+        Login,
+        Logout
+    }
+
+    public interface IUserLookup
+    {
+        Task<StoredUser?> FindByNameAsync(
+            string username);
+    }
+
+    public interface IAuthenticationAuditWriter
+    {
+        Task WriteAsync(
+            string userId,
+            AuthenticationAction action);
+    }
 }
