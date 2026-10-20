@@ -201,11 +201,13 @@ namespace PaternityTestSystem.Portfolio.Parsing
                 }
 
                 result.Markers.Add(
-                    new MarkerGenotype(
-                        marker,
-                        new Genotype(
+                    new MarkerGenotype
+                    {
+                        Marker = marker,
+                        Genotype = new Genotype(
                             alleles[0],
-                            alleles[1])));
+                            alleles[1])
+                    });
             }
 
             return result;
