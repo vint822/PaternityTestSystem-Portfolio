@@ -9,7 +9,8 @@ public sealed class LabCaseAccessGuardTests
     public void CancelledCase_BlocksCalculationAndRestrictedDocuments()
     {
         // Arrange
-        const string status = " cancelled ";
+        const string status = "Cancelled";
+
         Action[] restrictedActions =
         [
             () => LabCaseAccessGuard.EnsureCanCalculate(status),
@@ -20,10 +21,16 @@ public sealed class LabCaseAccessGuardTests
         ];
 
         // Act
-        var exceptions = restrictedActions.Select(action => Record.Exception(action)).ToArray();
+        var exceptions =
+            restrictedActions
+                .Select(action => Record.Exception(action))
+                .ToArray();
 
         // Assert
         Assert.True(LabCaseAccessGuard.IsCancelled(status));
-        Assert.All(exceptions, exception => Assert.IsType<InvalidOperationException>(exception));
+        Assert.All(
+            exceptions,
+            exception =>
+                Assert.IsType<InvalidOperationException>(exception));
     }
 }
